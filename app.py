@@ -1,7 +1,7 @@
 import streamlit as st
 import boto3
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, NoCredentialsError
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
@@ -18,15 +18,29 @@ st.set_page_config(page_title="S3 Multi-Profile Inspector", layout="wide", page_
 CONFIG_FILE = "profiles.json"
 AWS_CREDENTIALS_FILE = os.path.expanduser("~/.aws/credentials")
 
+# --- Helper: Safe Secrets Detector (Catches StreamlitSecretNotFoundError) ---
+def get_cloud_aws_credentials():
+    """Safely extracts Streamlit secrets without crashing if no secrets.toml exists."""
+    try:
+        if bool(st.secrets) and "aws" in st.secrets:
+            return st.secrets["aws"]
+    except BaseException:
+        pass
+    return None
+
+cloud_aws_creds = get_cloud_aws_credentials()
+has_cloud_secrets = cloud_aws_creds is not None
+has_local_creds = os.path.exists(AWS_CREDENTIALS_FILE)
+
 # --- Helper: Read available AWS CLI profiles ---
 def get_available_aws_profiles():
-    profiles = ["default"]
+    profiles = []
     if os.path.exists(AWS_CREDENTIALS_FILE):
         config = configparser.ConfigParser()
         config.read(AWS_CREDENTIALS_FILE)
         profiles = list(config.sections())
-        if "default" not in profiles:
-            profiles.insert(0, "default")
+    if "default" not in profiles:
+        profiles.insert(0, "default")
     return profiles
 
 # --- Helper: Local Preset Config Persistence ---
@@ -55,8 +69,11 @@ def load_presets():
         return DEFAULT_CONFIG
 
 def save_presets(data):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(data, f, indent=4)
+    except Exception:
+        pass
 
 config_data = load_presets()
 available_aws_profiles = get_available_aws_profiles()
@@ -69,26 +86,140 @@ with st.sidebar:
     default_preset = config_data.get("default_preset", "")
     default_idx = preset_names.index(default_preset) if default_preset in preset_names else 0
 
-    selected_preset = st.selectbox("Active Preset", preset_names, index=default_idx)
-    active_cfg = config_data["presets"].get(selected_preset, {})
+    def on_preset_change():
+        chosen_preset = st.session_state.selected_preset_key
+        p_cfg = config_data["presets"].get(chosen_preset, {})
+        st.session_state.current_aws_profile = p_cfg.get("aws_profile", "default")
+        st.session_state.current_bucket = p_cfg.get("bucket_name", "")
+        st.session_state.current_prefix = p_cfg.get("base_prefix", "")
+        st.session_state.current_region = p_cfg.get("fallback_region", "ap-southeast-2")
+        st.session_state.current_date_part = p_cfg.get("use_date_partitioning", True)
+        st.session_state.current_hourly = p_cfg.get("has_hourly_filenames", True)
 
-    # Auto-populated fields based on active preset
-    prof = active_cfg.get("aws_profile", "default")
-    aws_prof_idx = available_aws_profiles.index(prof) if prof in available_aws_profiles else 0
-    selected_aws_profile = st.selectbox("AWS CLI Profile", available_aws_profiles, index=aws_prof_idx)
+    selected_preset = st.selectbox(
+        "Active Preset",
+        preset_names,
+        index=default_idx,
+        key="selected_preset_key",
+        on_change=on_preset_change
+    )
+
+    if "current_aws_profile" not in st.session_state:
+        init_cfg = config_data["presets"].get(selected_preset, {})
+        st.session_state.current_aws_profile = init_cfg.get("aws_profile", "default")
+        st.session_state.current_bucket = init_cfg.get("bucket_name", "")
+        st.session_state.current_prefix = init_cfg.get("base_prefix", "")
+        st.session_state.current_region = init_cfg.get("fallback_region", "ap-southeast-2")
+        st.session_state.current_date_part = init_cfg.get("use_date_partitioning", True)
+        st.session_state.current_hourly = init_cfg.get("has_hourly_filenames", True)
+
+    cur_prof = st.session_state.current_aws_profile
+    prof_idx = available_aws_profiles.index(cur_prof) if cur_prof in available_aws_profiles else 0
     
-    bucket_name = st.text_input("S3 Bucket Name", value=active_cfg.get("bucket_name", ""))
-    base_prefix = st.text_input("Base Key Prefix", value=active_cfg.get("base_prefix", ""))
-    fallback_region = st.text_input("Fallback / Client Region", value=active_cfg.get("fallback_region", "ap-southeast-2"))
+    def on_profile_change():
+        new_prof = st.session_state.selected_profile_key
+        st.session_state.current_aws_profile = new_prof
+        matched = False
+        for p_name, p_val in config_data.get("presets", {}).items():
+            if p_val.get("aws_profile") == new_prof:
+                st.session_state.current_bucket = p_val.get("bucket_name", "")
+                st.session_state.current_prefix = p_val.get("base_prefix", "")
+                st.session_state.current_region = p_val.get("fallback_region", "ap-southeast-2")
+                st.session_state.current_date_part = p_val.get("use_date_partitioning", True)
+                st.session_state.current_hourly = p_val.get("has_hourly_filenames", True)
+                matched = True
+                break
+        if not matched:
+            st.session_state.current_bucket = ""
+            st.session_state.current_prefix = ""
+
+    selected_aws_profile = st.selectbox(
+        "AWS CLI Profile",
+        available_aws_profiles,
+        index=prof_idx,
+        key="selected_profile_key",
+        on_change=on_profile_change
+    )
+
+    manual_access_key = ""
+    manual_secret_key = ""
+    if not has_cloud_secrets and not has_local_creds:
+        st.warning("⚠️ No AWS credentials detected on disk or in secrets.")
+        with st.expander("🔑 Manual AWS Credentials", expanded=True):
+            manual_access_key = st.text_input("Access Key ID", type="password")
+            manual_secret_key = st.text_input("Secret Access Key", type="password")
+
+    def get_session():
+        if has_cloud_secrets:
+            try:
+                return boto3.Session(
+                    aws_access_key_id=cloud_aws_creds["aws_access_key_id"],
+                    aws_secret_access_key=cloud_aws_creds["aws_secret_access_key"],
+                    region_name=cloud_aws_creds.get("region_name", "ap-southeast-2")
+                )
+            except Exception:
+                pass
+        if manual_access_key.strip() and manual_secret_key.strip():
+            return boto3.Session(
+                aws_access_key_id=manual_access_key.strip(),
+                aws_secret_access_key=manual_secret_key.strip(),
+                region_name=st.session_state.current_region
+            )
+        if has_local_creds and selected_aws_profile:
+            try:
+                s = boto3.Session(profile_name=selected_aws_profile)
+                if s.get_credentials():
+                    return s
+            except Exception:
+                pass
+        return None
+
+    @st.cache_data(ttl=300)
+    def list_s3_buckets(_session):
+        if not _session:
+            return []
+        try:
+            s3 = _session.client("s3")
+            response = s3.list_buckets()
+            return [b["Name"] for b in response.get("Buckets", [])]
+        except Exception:
+            return []
+
+    active_session = get_session()
+    discovered_buckets = list_s3_buckets(active_session) if active_session else []
+
+    st.write("**Target S3 Bucket**")
+    if discovered_buckets:
+        curr_b = st.session_state.current_bucket
+        b_idx = discovered_buckets.index(curr_b) if curr_b in discovered_buckets else 0
+        bucket_select_mode = st.radio("Bucket Input Mode", ["Choose from List", "Type Manually"], horizontal=True)
+        if bucket_select_mode == "Choose from List":
+            bucket_name = st.selectbox("Select Bucket", discovered_buckets, index=b_idx)
+            st.session_state.current_bucket = bucket_name
+        else:
+            bucket_name = st.text_input("Bucket Name", value=st.session_state.current_bucket)
+            st.session_state.current_bucket = bucket_name
+    else:
+        bucket_name = st.text_input("Bucket Name", value=st.session_state.current_bucket)
+        st.session_state.current_bucket = bucket_name
+
+    base_prefix = st.text_input("Base Key Prefix", value=st.session_state.current_prefix)
+    st.session_state.current_prefix = base_prefix
     
-    use_date_partitioning = st.checkbox("Partitioned by YYYY/MM/DD folders", value=active_cfg.get("use_date_partitioning", True))
-    has_hourly_filenames = st.checkbox("Files have hourly timestamps (_HH.)", value=active_cfg.get("has_hourly_filenames", True))
+    fallback_region = st.text_input("Fallback / Client Region", value=st.session_state.current_region)
+    st.session_state.current_region = fallback_region
+    
+    use_date_partitioning = st.checkbox("Partitioned by YYYY/MM/DD folders", value=st.session_state.current_date_part)
+    st.session_state.current_date_part = use_date_partitioning
+    
+    has_hourly_filenames = st.checkbox("Files have hourly timestamps (_HH.)", value=st.session_state.current_hourly)
+    st.session_state.current_hourly = has_hourly_filenames
 
     max_workers = st.slider("Concurrent Scan Threads", min_value=1, max_value=16, value=6)
 
-    # --- Preset Management Expander ---
+    # Preset Manager
     with st.expander("🛠️ Manage / Save Presets"):
-        new_preset_name = st.text_input("Preset Name to Save/Update", value=selected_preset)
+        new_preset_name = st.text_input("Preset Name", value=selected_preset)
         col_p1, col_p2 = st.columns(2)
         
         with col_p1:
@@ -123,7 +254,7 @@ with st.sidebar:
 # --- Main UI Search Parameters ---
 st.title("🔍 S3 Multi-Bucket Inspector")
 
-# Date & Time Filters (Adaptive based on preset settings)
+# Date & Time Filters
 if use_date_partitioning:
     col1, col2 = st.columns(2)
     with col1:
@@ -158,19 +289,6 @@ with col_ctx2:
 
 
 # --- Helper Logic ---
-def get_session():
-    # 1. If running on Streamlit Community Cloud (Secrets configured)
-    if "aws" in st.secrets:
-        return boto3.Session(
-            aws_access_key_id=st.secrets["aws"]["aws_access_key_id"],
-            aws_secret_access_key=st.secrets["aws"]["aws_secret_access_key"],
-            region_name=st.secrets["aws"].get("region_name", "ap-southeast-2"),
-        )
-    # 2. If running locally with ~/.aws/credentials
-    if selected_aws_profile and selected_aws_profile != "default":
-        return boto3.Session(profile_name=selected_aws_profile)
-    return boto3.Session()
-
 def resolve_bucket_region(session, bucket, fallback):
     try:
         s3_client = session.client("s3", region_name=fallback)
@@ -285,8 +403,17 @@ if st.button("🚀 Start Search", type="primary"):
         st.warning("Please enter a search term.")
         st.stop()
 
+    if not bucket_name.strip():
+        st.error("Please enter or select a bucket name.")
+        st.stop()
+
     if use_date_partitioning and start_date > end_date:
         st.error("Start Date cannot be later than End Date.")
+        st.stop()
+
+    session = get_session()
+    if session is None:
+        st.error("❌ Authentication Error: No valid AWS credentials found. Configure your AWS profile locally, enter keys in the sidebar, or set Streamlit Cloud Secrets.")
         st.stop()
 
     try:
@@ -296,7 +423,6 @@ if st.button("🚀 Start Search", type="primary"):
         st.stop()
 
     try:
-        session = get_session()
         bucket_region = resolve_bucket_region(session, bucket_name, fallback_region)
         config = Config(
             region_name=bucket_region,
@@ -308,12 +434,12 @@ if st.button("🚀 Start Search", type="primary"):
         s3 = session.client("s3", config=config)
         s3.head_bucket(Bucket=bucket_name)
     except Exception as e:
-        st.error(f"Failed to connect to AWS: {e}")
+        st.error(f"Failed to connect to AWS bucket '{bucket_name}': {e}")
         st.stop()
 
     search_prefixes = generate_date_prefixes(start_date, end_date, base_prefix) if use_date_partitioning else [base_prefix.strip()]
     status_text = st.empty()
-    status_text.info(f"Connected using AWS Profile: `{selected_aws_profile}` in `{bucket_region}`. Listing keys...")
+    status_text.info(f"Targeting region `{bucket_region}`. Listing keys...")
 
     target_keys = []
     skipped_by_hour = 0
@@ -378,7 +504,7 @@ if st.button("🚀 Start Search", type="primary"):
                                 Params={"Bucket": bucket_name, "Key": key},
                                 ExpiresIn=900
                             )
-                            st.link_button(f"⬇️ Download Raw Object ({file_name})", download_url)
+                            st.link_button(f"⬇️ Download Raw Archive ({file_name})", download_url)
                         except Exception as err:
                             st.caption(f"Error creating link: {err}")
 
