@@ -78,6 +78,12 @@ def save_presets(data):
 config_data = load_presets()
 available_aws_profiles = get_available_aws_profiles()
 
+# Initialize session state for persistent results across reruns
+if "search_results" not in st.session_state:
+    st.session_state.search_results = None
+if "search_meta" not in st.session_state:
+    st.session_state.search_meta = None
+
 # --- Sidebar: Presets & Configurations ---
 with st.sidebar:
     st.header("🗂️ S3 Profiles & Presets")
@@ -141,7 +147,7 @@ with st.sidebar:
         on_change=on_profile_change
     )
 
-    # Manual key input fallback (for browser visitors when running on the web)
+    # Manual key input fallback (for browser visitors without CLI/secrets)
     manual_access_key = ""
     manual_secret_key = ""
     if not has_cloud_secrets and not has_local_creds:
@@ -273,7 +279,7 @@ else:
 
 col_search, col_opts = st.columns([3, 2])
 with col_search:
-    search_term = st.text_input("Search Term / Unique ID / Pattern", placeholder="e.g. order_uuid or error_code")
+    search_term = st.text_input("Search Term / Unique ID / Pattern", placeholder="e.g. D145B2C09B227BCBDF or (ERROR|WARN).+timeout")
 with col_opts:
     st.write("Match Options")
     co1, co2 = st.columns(2)
@@ -281,6 +287,29 @@ with col_opts:
         use_regex = st.checkbox("Regex Mode", value=False)
     with co2:
         case_sensitive = st.checkbox("Case Sensitive", value=False)
+
+# Regex User Guide & Cheatsheet
+with st.expander("💡 How to use Regex Mode (Instructions & Examples)", expanded=False):
+    st.markdown("""
+    When **Regex Mode** is checked, you can search for advanced patterns rather than exact literal text.
+    
+    ### 📌 Common Pattern Examples
+    | Use Case | Example Query | What it matches |
+    | :--- | :--- | :--- |
+    | **Unique ID + Error only** | `D145B2C09B227BCBDF.*(ERROR\|Exception)` | Lines with this ID that *also* contain an error or exception. |
+    | **Multiple IDs (OR search)** | `(ORD_101\|ORD_102\|ORD_103)` | Lines containing *any* of these three order numbers. |
+    | **HTTP 5xx Server Errors** | `HTTP/1\.[01]"\s+50[0-5]` | HTTP status codes 500, 502, 503, 504, 505 in access logs. |
+    | **Standard UUIDs** | `[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}` | Any 36-character UUID/GUID request ID. |
+    | **High Latency / Slow Queries** | `(took\|latency)[=:\s]+[1-9]\d{3,}\s*ms` | Execution times of 1,000 ms (1 sec) or greater. |
+    | **Database Deadlocks / Pool** | `(Deadlock\|ConnectionPoolTimeout\|Too many connections)` | Database exhaustion or lock errors. |
+
+    ### 🔤 Syntax Quick-Reference
+    * `.*` : Matches any character sequence (e.g. `order.*failed`).
+    * `(A|B)` : Matches either **A** OR **B** (e.g. `(ERROR|FATAL)`).
+    * `\d+` : Matches one or more numbers (e.g. `user_\d+`).
+    * `^` and `$` : Start and end of line (e.g. `^FATAL`).
+    * `\` : Escape special characters (e.g. `\[ERROR\]` for literal brackets).
+    """)
 
 col_ctx1, col_ctx2 = st.columns(2)
 with col_ctx1:
@@ -398,7 +427,7 @@ def extract_inner_file(bucket, key, session, config):
     return key.split("/")[-1], raw_data
 
 
-# --- Execution ---
+# --- Search Execution Trigger ---
 if st.button("🚀 Start Search", type="primary"):
     if not search_term.strip():
         st.warning("Please enter a search term.")
@@ -458,13 +487,14 @@ if st.button("🚀 Start Search", type="primary"):
     total_files = len(target_keys)
     if total_files == 0:
         status_text.warning("No files found matching the criteria.")
+        st.session_state.search_results = []
+        st.session_state.search_meta = None
         st.stop()
 
     status_text.info(f"Scanning {total_files} file(s)... (skipped {skipped_by_hour} out of hour bounds)")
     progress_bar = st.progress(0)
-    matched_count = 0
     scanned_count = 0
-    results_container = st.container()
+    collected_results = []
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
@@ -485,24 +515,52 @@ if st.button("🚀 Start Search", type="primary"):
             progress_bar.progress(scanned_count / total_files)
 
             res = future.result()
-            if res["error"]:
-                st.caption(f"⚠️ Error scanning `{res['key']}`: {res['error']}")
-                continue
+            if not res["error"] and res["matches"]:
+                collected_results.append(res)
 
-            if res["matches"]:
-                matched_count += 1
+    progress_bar.empty()
+    status_text.empty()
+
+    # Store in session state so subsequent clicks (e.g. downloads) won't wipe results
+    st.session_state.search_results = collected_results
+    st.session_state.search_meta = {
+        "total_scanned": total_files,
+        "matched_count": len(collected_results),
+        "bucket": bucket_name,
+        "region": bucket_region
+    }
+
+
+# --- Persistent Results Rendering ---
+if st.session_state.search_results is not None:
+    meta = st.session_state.search_meta
+    if meta:
+        st.success(f"Finished! Scanned **{meta['total_scanned']}** files. Found matches in **{meta['matched_count']}** file(s).")
+
+        session = get_session()
+        if session:
+            config = Config(
+                region_name=meta["region"],
+                signature_version="s3v4",
+                retries={"max_attempts": 3, "mode": "standard"},
+                connect_timeout=10,
+                read_timeout=60
+            )
+            s3 = session.client("s3", config=config)
+
+            for res in st.session_state.search_results:
                 key = res["key"]
                 matches = res["matches"]
                 file_name = key.split("/")[-1]
 
-                with results_container.expander(f"📄 **{key}** ({len(matches)} match incident/s)", expanded=True):
+                with st.expander(f"📄 **{key}** ({len(matches)} match incident/s)", expanded=True):
                     btn_col1, btn_col2 = st.columns([1, 1])
 
                     with btn_col1:
                         try:
                             download_url = s3.generate_presigned_url(
                                 "get_object",
-                                Params={"Bucket": bucket_name, "Key": key},
+                                Params={"Bucket": meta["bucket"], "Key": key},
                                 ExpiresIn=900
                             )
                             st.link_button(f"⬇️ Download Raw Archive ({file_name})", download_url)
@@ -511,7 +569,7 @@ if st.button("🚀 Start Search", type="primary"):
 
                     with btn_col2:
                         try:
-                            inner_name, log_bytes = extract_inner_file(bucket_name, key, session, config)
+                            inner_name, log_bytes = extract_inner_file(meta["bucket"], key, session, config)
                             st.download_button(
                                 label=f"📂 Extract & Download Text ({inner_name})",
                                 data=log_bytes,
@@ -525,6 +583,3 @@ if st.button("🚀 Start Search", type="primary"):
                     for idx, (member_name, block) in enumerate(matches, 1):
                         st.caption(f"**Match #{idx}** from member: `{member_name}`")
                         st.code("\n".join(block), language="log")
-
-    progress_bar.empty()
-    status_text.success(f"Finished! Scanned **{total_files}** files. Found matches in **{matched_count}** file(s).")
