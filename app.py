@@ -13,12 +13,12 @@ import re
 import os
 import json
 
-st.set_page_config(page_title="S3 Multi-Profile Inspector", layout="wide", page_icon="🛡️")
+st.set_page_config(page_title="S3 Log Inspector", layout="wide", page_icon="🛡️")
 
 CONFIG_FILE = "profiles.json"
 AWS_CREDENTIALS_FILE = os.path.expanduser("~/.aws/credentials")
 
-# --- Helper: Safe Secrets Detector (Catches StreamlitSecretNotFoundError) ---
+# --- Helper: Safe Secrets Detector ---
 def get_cloud_aws_credentials():
     """Safely extracts Streamlit secrets without crashing if no secrets.toml exists."""
     try:
@@ -43,17 +43,17 @@ def get_available_aws_profiles():
         profiles.insert(0, "default")
     return profiles
 
-# --- Helper: Local Preset Config Persistence ---
+# --- Helper: Clean Default Presets ---
 DEFAULT_CONFIG = {
-    "default_preset": "Vodaplay Server Logs",
+    "default_preset": "Default Environment",
     "presets": {
-        "Vodaplay Server Logs": {
-            "aws_profile": "vodaplay",
-            "bucket_name": "vodaplay-serverlogs",
-            "base_prefix": "api-location/app_server",
-            "fallback_region": "ap-southeast-2",
+        "Default Environment": {
+            "aws_profile": "default",
+            "bucket_name": "",
+            "base_prefix": "",
+            "fallback_region": "us-east-1",
             "use_date_partitioning": True,
-            "has_hourly_filenames": True
+            "has_hourly_filenames": False
         }
     }
 }
@@ -92,9 +92,9 @@ with st.sidebar:
         st.session_state.current_aws_profile = p_cfg.get("aws_profile", "default")
         st.session_state.current_bucket = p_cfg.get("bucket_name", "")
         st.session_state.current_prefix = p_cfg.get("base_prefix", "")
-        st.session_state.current_region = p_cfg.get("fallback_region", "ap-southeast-2")
+        st.session_state.current_region = p_cfg.get("fallback_region", "us-east-1")
         st.session_state.current_date_part = p_cfg.get("use_date_partitioning", True)
-        st.session_state.current_hourly = p_cfg.get("has_hourly_filenames", True)
+        st.session_state.current_hourly = p_cfg.get("has_hourly_filenames", False)
 
     selected_preset = st.selectbox(
         "Active Preset",
@@ -109,9 +109,9 @@ with st.sidebar:
         st.session_state.current_aws_profile = init_cfg.get("aws_profile", "default")
         st.session_state.current_bucket = init_cfg.get("bucket_name", "")
         st.session_state.current_prefix = init_cfg.get("base_prefix", "")
-        st.session_state.current_region = init_cfg.get("fallback_region", "ap-southeast-2")
+        st.session_state.current_region = init_cfg.get("fallback_region", "us-east-1")
         st.session_state.current_date_part = init_cfg.get("use_date_partitioning", True)
-        st.session_state.current_hourly = init_cfg.get("has_hourly_filenames", True)
+        st.session_state.current_hourly = init_cfg.get("has_hourly_filenames", False)
 
     cur_prof = st.session_state.current_aws_profile
     prof_idx = available_aws_profiles.index(cur_prof) if cur_prof in available_aws_profiles else 0
@@ -124,9 +124,9 @@ with st.sidebar:
             if p_val.get("aws_profile") == new_prof:
                 st.session_state.current_bucket = p_val.get("bucket_name", "")
                 st.session_state.current_prefix = p_val.get("base_prefix", "")
-                st.session_state.current_region = p_val.get("fallback_region", "ap-southeast-2")
+                st.session_state.current_region = p_val.get("fallback_region", "us-east-1")
                 st.session_state.current_date_part = p_val.get("use_date_partitioning", True)
-                st.session_state.current_hourly = p_val.get("has_hourly_filenames", True)
+                st.session_state.current_hourly = p_val.get("has_hourly_filenames", False)
                 matched = True
                 break
         if not matched:
@@ -141,11 +141,12 @@ with st.sidebar:
         on_change=on_profile_change
     )
 
+    # Manual key input fallback (for browser visitors when running on the web)
     manual_access_key = ""
     manual_secret_key = ""
     if not has_cloud_secrets and not has_local_creds:
         st.warning("⚠️ No AWS credentials detected on disk or in secrets.")
-        with st.expander("🔑 Manual AWS Credentials", expanded=True):
+        with st.expander("🔑 Provide AWS Credentials", expanded=True):
             manual_access_key = st.text_input("Access Key ID", type="password")
             manual_secret_key = st.text_input("Secret Access Key", type="password")
 
@@ -155,7 +156,7 @@ with st.sidebar:
                 return boto3.Session(
                     aws_access_key_id=cloud_aws_creds["aws_access_key_id"],
                     aws_secret_access_key=cloud_aws_creds["aws_secret_access_key"],
-                    region_name=cloud_aws_creds.get("region_name", "ap-southeast-2")
+                    region_name=cloud_aws_creds.get("region_name", "us-east-1")
                 )
             except Exception:
                 pass
@@ -197,13 +198,13 @@ with st.sidebar:
             bucket_name = st.selectbox("Select Bucket", discovered_buckets, index=b_idx)
             st.session_state.current_bucket = bucket_name
         else:
-            bucket_name = st.text_input("Bucket Name", value=st.session_state.current_bucket)
+            bucket_name = st.text_input("Bucket Name", value=st.session_state.current_bucket, placeholder="e.g. my-app-logs")
             st.session_state.current_bucket = bucket_name
     else:
-        bucket_name = st.text_input("Bucket Name", value=st.session_state.current_bucket)
+        bucket_name = st.text_input("Bucket Name", value=st.session_state.current_bucket, placeholder="e.g. my-app-logs")
         st.session_state.current_bucket = bucket_name
 
-    base_prefix = st.text_input("Base Key Prefix", value=st.session_state.current_prefix)
+    base_prefix = st.text_input("Base Key Prefix", value=st.session_state.current_prefix, placeholder="e.g. logs/production")
     st.session_state.current_prefix = base_prefix
     
     fallback_region = st.text_input("Fallback / Client Region", value=st.session_state.current_region)
@@ -258,9 +259,9 @@ st.title("🔍 S3 Multi-Bucket Inspector")
 if use_date_partitioning:
     col1, col2 = st.columns(2)
     with col1:
-        start_date = st.date_input("Start Date", datetime(2026, 8, 1))
+        start_date = st.date_input("Start Date", datetime.now() - timedelta(days=7))
     with col2:
-        end_date = st.date_input("End Date", datetime(2026, 8, 13))
+        end_date = st.date_input("End Date", datetime.now())
 else:
     st.info("ℹ️ Flat mode active: scanning prefix directly without date subdirectories.")
     start_date, end_date = None, None
@@ -272,7 +273,7 @@ else:
 
 col_search, col_opts = st.columns([3, 2])
 with col_search:
-    search_term = st.text_input("Search Term / Unique ID / Pattern", placeholder="e.g. D145B2C09B227BCBDF or image_id_102")
+    search_term = st.text_input("Search Term / Unique ID / Pattern", placeholder="e.g. order_uuid or error_code")
 with col_opts:
     st.write("Match Options")
     co1, co2 = st.columns(2)
@@ -413,7 +414,7 @@ if st.button("🚀 Start Search", type="primary"):
 
     session = get_session()
     if session is None:
-        st.error("❌ Authentication Error: No valid AWS credentials found. Configure your AWS profile locally, enter keys in the sidebar, or set Streamlit Cloud Secrets.")
+        st.error("❌ Authentication Error: No valid AWS credentials found. Please provide keys in the sidebar or configure AWS CLI.")
         st.stop()
 
     try:
