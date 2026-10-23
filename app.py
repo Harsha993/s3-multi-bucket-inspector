@@ -258,8 +258,13 @@ with st.sidebar:
                 st.warning(f"Deleted '{selected_preset}'.")
                 st.rerun()
 
+    st.markdown("---")
+    st.caption("📬 **Support / Contact:**")
+    st.markdown("[harshas@yupptv.com](mailto:harshas@yupptv.com)")
+
 # --- Main UI Search Parameters ---
 st.title("🔍 S3 Multi-Bucket Inspector")
+st.caption("Maintained by **Harsha** • Contact: [harshas@yupptv.com](mailto:harshas@yupptv.com)")
 
 # Date & Time Filters
 if use_date_partitioning:
