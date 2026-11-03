@@ -5,6 +5,7 @@ from botocore.exceptions import ClientError, NoCredentialsError
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
+import threading
 import configparser
 import zipfile
 import gzip
@@ -51,7 +52,7 @@ DEFAULT_CONFIG = {
             "aws_profile": "default",
             "bucket_name": "",
             "base_prefix": "",
-            "fallback_region": "us-east-1",
+            "fallback_region": "ap-southeast-2",
             "use_date_partitioning": True,
             "has_hourly_filenames": False
         }
@@ -98,7 +99,7 @@ with st.sidebar:
         st.session_state.current_aws_profile = p_cfg.get("aws_profile", "default")
         st.session_state.current_bucket = p_cfg.get("bucket_name", "")
         st.session_state.current_prefix = p_cfg.get("base_prefix", "")
-        st.session_state.current_region = p_cfg.get("fallback_region", "us-east-1")
+        st.session_state.current_region = p_cfg.get("fallback_region", "ap-southeast-2")
         st.session_state.current_date_part = p_cfg.get("use_date_partitioning", True)
         st.session_state.current_hourly = p_cfg.get("has_hourly_filenames", False)
 
@@ -115,7 +116,7 @@ with st.sidebar:
         st.session_state.current_aws_profile = init_cfg.get("aws_profile", "default")
         st.session_state.current_bucket = init_cfg.get("bucket_name", "")
         st.session_state.current_prefix = init_cfg.get("base_prefix", "")
-        st.session_state.current_region = init_cfg.get("fallback_region", "us-east-1")
+        st.session_state.current_region = init_cfg.get("fallback_region", "ap-southeast-2")
         st.session_state.current_date_part = init_cfg.get("use_date_partitioning", True)
         st.session_state.current_hourly = init_cfg.get("has_hourly_filenames", False)
 
@@ -130,7 +131,7 @@ with st.sidebar:
             if p_val.get("aws_profile") == new_prof:
                 st.session_state.current_bucket = p_val.get("bucket_name", "")
                 st.session_state.current_prefix = p_val.get("base_prefix", "")
-                st.session_state.current_region = p_val.get("fallback_region", "us-east-1")
+                st.session_state.current_region = p_val.get("fallback_region", "ap-southeast-2")
                 st.session_state.current_date_part = p_val.get("use_date_partitioning", True)
                 st.session_state.current_hourly = p_val.get("has_hourly_filenames", False)
                 matched = True
@@ -147,7 +148,6 @@ with st.sidebar:
         on_change=on_profile_change
     )
 
-    # Manual key input fallback (for browser visitors without CLI/secrets)
     manual_access_key = ""
     manual_secret_key = ""
     if not has_cloud_secrets and not has_local_creds:
@@ -162,7 +162,7 @@ with st.sidebar:
                 return boto3.Session(
                     aws_access_key_id=cloud_aws_creds["aws_access_key_id"],
                     aws_secret_access_key=cloud_aws_creds["aws_secret_access_key"],
-                    region_name=cloud_aws_creds.get("region_name", "us-east-1")
+                    region_name=cloud_aws_creds.get("region_name", "ap-southeast-2")
                 )
             except Exception:
                 pass
@@ -222,7 +222,7 @@ with st.sidebar:
     has_hourly_filenames = st.checkbox("Files have hourly timestamps (_HH.)", value=st.session_state.current_hourly)
     st.session_state.current_hourly = has_hourly_filenames
 
-    max_workers = st.slider("Concurrent Scan Threads", min_value=1, max_value=16, value=6)
+    max_workers = st.slider("Concurrent Scan Threads", min_value=1, max_value=32, value=12)
 
     # Preset Manager
     with st.expander("🛠️ Manage / Save Presets"):
@@ -287,11 +287,13 @@ with col_search:
     search_term = st.text_input("Search Term / Unique ID / Pattern", placeholder="e.g. D145B2C09B227BCBDF or (ERROR|WARN).+timeout")
 with col_opts:
     st.write("Match Options")
-    co1, co2 = st.columns(2)
+    co1, co2, co3 = st.columns(3)
     with co1:
         use_regex = st.checkbox("Regex Mode", value=False)
     with co2:
         case_sensitive = st.checkbox("Case Sensitive", value=False)
+    with co3:
+        stop_on_first = st.checkbox("Stop on 1st Match", value=False, help="Stops scanning all remaining files as soon as 1 matching file is found.")
 
 # Regex User Guide & Cheatsheet
 with st.expander("💡 How to use Regex Mode (Instructions & Examples)", expanded=False):
@@ -329,7 +331,7 @@ def resolve_bucket_region(session, bucket, fallback):
         s3_client = session.client("s3", region_name=fallback)
         loc = s3_client.get_bucket_location(Bucket=bucket).get("LocationConstraint")
         if not loc:
-            return "us-east-1"
+            return fallback
         if loc == "EU":
             return "eu-west-1"
         return loc
@@ -361,38 +363,50 @@ def compile_pattern(query, regex_mode, is_case_sensitive):
     flags = 0 if is_case_sensitive else re.IGNORECASE
     return re.compile(query, flags) if regex_mode else re.compile(re.escape(query), flags)
 
-def inspect_s3_file(bucket, key, pattern, context_size, max_matches, session, config):
+# --- Optimized Worker with stop_event check ---
+def inspect_s3_file(bucket, key, pattern, context_size, max_matches, session, config, stop_event=None):
+    # Short-circuit: if another thread already found a match and stop requested, exit immediately
+    if stop_event and stop_event.is_set():
+        return {"key": key, "matches": [], "error": None, "skipped": True}
+
     s3 = session.client("s3", config=config)
     match_blocks = []
     try:
         response = s3.get_object(Bucket=bucket, Key=key)
-        raw_bytes = response["Body"].read()
+        body = response["Body"]
         file_streams = []
 
-        if key.endswith(".zip"):
+        if key.endswith(".gz"):
+            file_streams.append((key.split("/")[-1].replace(".gz", ""), gzip.GzipFile(fileobj=body)))
+        elif key.endswith(".zip"):
+            raw_bytes = body.read()
             zf = zipfile.ZipFile(io.BytesIO(raw_bytes), "r")
             for member_name in zf.namelist():
                 file_streams.append((member_name, zf.open(member_name, "r")))
-        elif key.endswith(".gz"):
-            gf = gzip.GzipFile(fileobj=io.BytesIO(raw_bytes), mode="rb")
-            file_streams.append((key.split("/")[-1].replace(".gz", ""), gf))
         else:
-            file_streams.append((key.split("/")[-1], io.BytesIO(raw_bytes)))
+            file_streams.append((key.split("/")[-1], body))
 
         for member_name, stream in file_streams:
+            if stop_event and stop_event.is_set():
+                break
+
             line_window = deque(maxlen=context_size)
             lines_after_needed = 0
             current_block = []
             line_no = 0
 
             for raw_line in stream:
+                if stop_event and stop_event.is_set():
+                    break
+
                 line_no += 1
-                line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                try:
+                    line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                except Exception:
+                    continue
 
                 if pattern.search(line):
-                    block_lines = []
-                    for prev_no, prev_line in line_window:
-                        block_lines.append(f"   {prev_no:5d} | {prev_line}")
+                    block_lines = [f"   {prev_no:5d} | {prev_line}" for prev_no, prev_line in line_window]
                     block_lines.append(f">> {line_no:5d} | {line}")
                     current_block = block_lines
                     lines_after_needed = context_size
@@ -402,7 +416,7 @@ def inspect_s3_file(bucket, key, pattern, context_size, max_matches, session, co
                     if lines_after_needed == 0:
                         match_blocks.append((member_name, current_block))
                         if len(match_blocks) >= max_matches:
-                            break
+                            return {"key": key, "matches": match_blocks, "error": None, "skipped": False}
 
                 line_window.append((line_no, line))
 
@@ -410,11 +424,11 @@ def inspect_s3_file(bucket, key, pattern, context_size, max_matches, session, co
                 match_blocks.append((member_name, current_block))
 
             if len(match_blocks) >= max_matches:
-                break
+                return {"key": key, "matches": match_blocks, "error": None, "skipped": False}
 
-        return {"key": key, "matches": match_blocks, "error": None}
+        return {"key": key, "matches": match_blocks, "error": None, "skipped": False}
     except Exception as e:
-        return {"key": key, "matches": [], "error": str(e)}
+        return {"key": key, "matches": [], "error": str(e), "skipped": False}
 
 def extract_inner_file(bucket, key, session, config):
     s3 = session.client("s3", config=config)
@@ -462,9 +476,10 @@ if st.button("🚀 Start Search", type="primary"):
         config = Config(
             region_name=bucket_region,
             signature_version="s3v4",
-            retries={"max_attempts": 3, "mode": "standard"},
-            connect_timeout=10,
-            read_timeout=60
+            max_pool_connections=max_workers + 6,
+            retries={"max_attempts": 2, "mode": "standard"},
+            connect_timeout=6,
+            read_timeout=45
         )
         s3 = session.client("s3", config=config)
         s3.head_bucket(Bucket=bucket_name)
@@ -496,10 +511,13 @@ if st.button("🚀 Start Search", type="primary"):
         st.session_state.search_meta = None
         st.stop()
 
-    status_text.info(f"Scanning {total_files} file(s)... (skipped {skipped_by_hour} out of hour bounds)")
+    mode_label = " (Stop on 1st match enabled)" if stop_on_first else ""
+    status_text.info(f"Scanning {total_files} file(s) across {max_workers} threads{mode_label}... (skipped {skipped_by_hour} out of hour bounds)")
     progress_bar = st.progress(0)
     scanned_count = 0
     collected_results = []
+    
+    stop_event = threading.Event()
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
@@ -511,17 +529,25 @@ if st.button("🚀 Start Search", type="primary"):
                 context_lines,
                 max_display_matches,
                 session,
-                config
+                config,
+                stop_event
             ): key for key in target_keys
         }
 
         for future in as_completed(future_map):
             scanned_count += 1
-            progress_bar.progress(scanned_count / total_files)
+            progress_bar.progress(min(scanned_count / total_files, 1.0))
 
             res = future.result()
-            if not res["error"] and res["matches"]:
+            if not res.get("skipped", False) and not res["error"] and res["matches"]:
                 collected_results.append(res)
+                
+                # If short-circuit option is turned on, cancel all other tasks immediately!
+                if stop_on_first:
+                    stop_event.set()
+                    for f in future_map:
+                        f.cancel()
+                    break
 
     progress_bar.empty()
     status_text.empty()
@@ -529,10 +555,12 @@ if st.button("🚀 Start Search", type="primary"):
     # Store in session state so subsequent clicks (e.g. downloads) won't wipe results
     st.session_state.search_results = collected_results
     st.session_state.search_meta = {
-        "total_scanned": total_files,
+        "total_scanned": scanned_count,
+        "total_available": total_files,
         "matched_count": len(collected_results),
         "bucket": bucket_name,
-        "region": bucket_region
+        "region": bucket_region,
+        "stopped_early": stop_on_first and len(collected_results) > 0
     }
 
 
@@ -540,16 +568,19 @@ if st.button("🚀 Start Search", type="primary"):
 if st.session_state.search_results is not None:
     meta = st.session_state.search_meta
     if meta:
-        st.success(f"Finished! Scanned **{meta['total_scanned']}** files. Found matches in **{meta['matched_count']}** file(s).")
+        if meta.get("stopped_early"):
+            st.success(f"🎯 **Found 1st match!** Stopped remaining scans after inspecting **{meta['total_scanned']} / {meta['total_available']}** files.")
+        else:
+            st.success(f"Finished! Scanned **{meta['total_scanned']}** files. Found matches in **{meta['matched_count']}** file(s).")
 
         session = get_session()
         if session:
             config = Config(
                 region_name=meta["region"],
                 signature_version="s3v4",
-                retries={"max_attempts": 3, "mode": "standard"},
-                connect_timeout=10,
-                read_timeout=60
+                retries={"max_attempts": 2, "mode": "standard"},
+                connect_timeout=6,
+                read_timeout=45
             )
             s3 = session.client("s3", config=config)
 
