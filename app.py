@@ -44,7 +44,7 @@ def get_available_aws_profiles():
         profiles.insert(0, "default")
     return profiles
 
-# --- Helper: Clean Default Presets ---
+# --- Helper: Default Presets Schema ---
 DEFAULT_CONFIG = {
     "default_preset": "Default Environment",
     "presets": {
@@ -54,7 +54,9 @@ DEFAULT_CONFIG = {
             "base_prefix": "",
             "fallback_region": "ap-southeast-2",
             "use_date_partitioning": True,
-            "has_hourly_filenames": False
+            "has_hourly_filenames": False,
+            "access_key": "",
+            "secret_key": ""
         }
     }
 }
@@ -65,7 +67,12 @@ def load_presets():
         return DEFAULT_CONFIG
     try:
         with open(CONFIG_FILE, "r") as f:
-            return json.load(f)
+            data = json.load(f)
+            # Ensure backwards compatibility with older preset entries
+            for p_val in data.get("presets", {}).values():
+                p_val.setdefault("access_key", "")
+                p_val.setdefault("secret_key", "")
+            return data
     except Exception:
         return DEFAULT_CONFIG
 
@@ -79,11 +86,15 @@ def save_presets(data):
 config_data = load_presets()
 available_aws_profiles = get_available_aws_profiles()
 
-# Initialize session state for persistent results across reruns
+# Initialize session state for search persistence and custom credentials
 if "search_results" not in st.session_state:
     st.session_state.search_results = None
 if "search_meta" not in st.session_state:
     st.session_state.search_meta = None
+if "session_access_key" not in st.session_state:
+    st.session_state.session_access_key = ""
+if "session_secret_key" not in st.session_state:
+    st.session_state.session_secret_key = ""
 
 # --- Sidebar: Presets & Configurations ---
 with st.sidebar:
@@ -102,6 +113,8 @@ with st.sidebar:
         st.session_state.current_region = p_cfg.get("fallback_region", "ap-southeast-2")
         st.session_state.current_date_part = p_cfg.get("use_date_partitioning", True)
         st.session_state.current_hourly = p_cfg.get("has_hourly_filenames", False)
+        st.session_state.session_access_key = p_cfg.get("access_key", "")
+        st.session_state.session_secret_key = p_cfg.get("secret_key", "")
 
     selected_preset = st.selectbox(
         "Active Preset",
@@ -119,6 +132,8 @@ with st.sidebar:
         st.session_state.current_region = init_cfg.get("fallback_region", "ap-southeast-2")
         st.session_state.current_date_part = init_cfg.get("use_date_partitioning", True)
         st.session_state.current_hourly = init_cfg.get("has_hourly_filenames", False)
+        st.session_state.session_access_key = init_cfg.get("access_key", "")
+        st.session_state.session_secret_key = init_cfg.get("secret_key", "")
 
     cur_prof = st.session_state.current_aws_profile
     prof_idx = available_aws_profiles.index(cur_prof) if cur_prof in available_aws_profiles else 0
@@ -134,6 +149,8 @@ with st.sidebar:
                 st.session_state.current_region = p_val.get("fallback_region", "ap-southeast-2")
                 st.session_state.current_date_part = p_val.get("use_date_partitioning", True)
                 st.session_state.current_hourly = p_val.get("has_hourly_filenames", False)
+                st.session_state.session_access_key = p_val.get("access_key", "")
+                st.session_state.session_secret_key = p_val.get("secret_key", "")
                 matched = True
                 break
         if not matched:
@@ -148,15 +165,36 @@ with st.sidebar:
         on_change=on_profile_change
     )
 
-    manual_access_key = ""
-    manual_secret_key = ""
-    if not has_cloud_secrets and not has_local_creds:
-        st.warning("⚠️ No AWS credentials detected on disk or in secrets.")
-        with st.expander("🔑 Provide AWS Credentials", expanded=True):
-            manual_access_key = st.text_input("Access Key ID", type="password")
-            manual_secret_key = st.text_input("Secret Access Key", type="password")
+    # --- Bucket-Specific / Custom Credentials Expander ---
+    has_custom_keys = bool(st.session_state.session_access_key.strip() and st.session_state.session_secret_key.strip())
+    with st.expander("🔑 AWS Bucket Credentials (Custom Keys)", expanded=not (has_cloud_secrets or has_local_creds) or has_custom_keys):
+        st.caption("Provide specific keys for this bucket/account. If left blank, it falls back to your active CLI profile or Streamlit Secrets.")
+        custom_access_key = st.text_input(
+            "Access Key ID",
+            value=st.session_state.session_access_key,
+            type="password",
+            key="input_access_key"
+        )
+        custom_secret_key = st.text_input(
+            "Secret Access Key",
+            value=st.session_state.session_secret_key,
+            type="password",
+            key="input_secret_key"
+        )
+        # Keep session synchronized with typed inputs
+        st.session_state.session_access_key = custom_access_key
+        st.session_state.session_secret_key = custom_secret_key
 
+    # Session Resolver: Custom keys take highest priority, followed by Cloud Secrets, then CLI profile
     def get_session():
+        # Priority 1: User explicitly entered credentials for this session/preset
+        if st.session_state.session_access_key.strip() and st.session_state.session_secret_key.strip():
+            return boto3.Session(
+                aws_access_key_id=st.session_state.session_access_key.strip(),
+                aws_secret_access_key=st.session_state.session_secret_key.strip(),
+                region_name=st.session_state.current_region
+            )
+        # Priority 2: Streamlit Cloud Secrets
         if has_cloud_secrets:
             try:
                 return boto3.Session(
@@ -166,12 +204,7 @@ with st.sidebar:
                 )
             except Exception:
                 pass
-        if manual_access_key.strip() and manual_secret_key.strip():
-            return boto3.Session(
-                aws_access_key_id=manual_access_key.strip(),
-                aws_secret_access_key=manual_secret_key.strip(),
-                region_name=st.session_state.current_region
-            )
+        # Priority 3: Local AWS credentials file
         if has_local_creds and selected_aws_profile:
             try:
                 s = boto3.Session(profile_name=selected_aws_profile)
@@ -227,6 +260,7 @@ with st.sidebar:
     # Preset Manager
     with st.expander("🛠️ Manage / Save Presets"):
         new_preset_name = st.text_input("Preset Name", value=selected_preset)
+        save_keys_in_preset = st.checkbox("Save these credentials in this preset", value=has_custom_keys)
         col_p1, col_p2 = st.columns(2)
         
         with col_p1:
@@ -238,7 +272,9 @@ with st.sidebar:
                         "base_prefix": base_prefix.strip(),
                         "fallback_region": fallback_region.strip(),
                         "use_date_partitioning": use_date_partitioning,
-                        "has_hourly_filenames": has_hourly_filenames
+                        "has_hourly_filenames": has_hourly_filenames,
+                        "access_key": st.session_state.session_access_key.strip() if save_keys_in_preset else "",
+                        "secret_key": st.session_state.session_secret_key.strip() if save_keys_in_preset else ""
                     }
                     save_presets(config_data)
                     st.success(f"Saved '{new_preset_name}'!")
@@ -365,7 +401,6 @@ def compile_pattern(query, regex_mode, is_case_sensitive):
 
 # --- Optimized Worker with stop_event check ---
 def inspect_s3_file(bucket, key, pattern, context_size, max_matches, session, config, stop_event=None):
-    # Short-circuit: if another thread already found a match and stop requested, exit immediately
     if stop_event and stop_event.is_set():
         return {"key": key, "matches": [], "error": None, "skipped": True}
 
@@ -542,7 +577,6 @@ if st.button("🚀 Start Search", type="primary"):
             if not res.get("skipped", False) and not res["error"] and res["matches"]:
                 collected_results.append(res)
                 
-                # If short-circuit option is turned on, cancel all other tasks immediately!
                 if stop_on_first:
                     stop_event.set()
                     for f in future_map:
